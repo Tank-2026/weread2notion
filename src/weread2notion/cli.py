@@ -54,17 +54,23 @@ NOTION_ID_IN_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# 接口字段名在不同版本间有差异，按顺序兜底取值
+# 接口字段名在不同版本间有差异，按顺序兜底取值。
+# 首选项已于 2026-09-02 实测确认（/book/getprogress 真实返回）：
+#   ['appId', 'bookVersion', 'chapterIdx', 'chapterOffset', 'chapterUid',
+#    'installId', 'isStartReading', 'progress', 'readingTime',
+#    'recordReadingTime', 'repairOffsetTime', 'reviewId', 'startReadingTime',
+#    'summary', 'synckey', 'ttsTime', 'updateTime']
+# 注：finishTime 只在书籍读完后才出现，未读完时该字段不存在（值为 0）。
 START_TIME_KEYS = (
+    "startReadingTime",   # 实测命中
     "beginReadingTime",
-    "startReadingTime",
     "beginReadTime",
     "firstReadTime",
     "readUpdateTime",
     "createTime",
 )
 READING_TIME_KEYS = (
-    "recordReadingTime",
+    "recordReadingTime",  # 实测命中
     "readingTime",
     "totalReadingTime",
     "readTime",
@@ -1000,7 +1006,20 @@ def backfill():
             if seconds:
                 raw["阅读时长"] = reading_time_value(seconds)
         if not raw:
-            print(f"[接口无数据] {title}：缺 {missing}，但微信读书未返回对应值")
+            hint = []
+            if "结束时间" in missing:
+                hint.append(
+                    "结束时间：该书尚未读完，微信读书只在读完后才返回 finishTime（正常）"
+                    if read_info.get("markedStatus") != 4
+                    else "结束时间：接口未返回"
+                )
+            if "开始时间" in missing:
+                hint.append("开始时间：接口未返回有效的 startReadingTime（可能从未正式开始阅读）")
+            if "阅读时长" in missing:
+                hint.append("阅读时长：接口未返回")
+            if "类型" in missing:
+                hint.append("类型：无法写入")
+            print(f"[接口无数据] {title} -> {'；'.join(hint) or '微信读书未返回对应值'}")
             continue
         payload = build_notion_properties(raw)
         if not payload:
