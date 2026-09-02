@@ -5,7 +5,7 @@ import re
 import time
 from notion_client import Client
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import hashlib
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
@@ -39,6 +39,10 @@ WEREAD_SKILL_VERSION = "1.0.4"
 NOTION_VERSION = "2026-03-11"
 BOOKMARK_CALLOUT_ICON = "〰️"
 NOTE_CALLOUT_ICON = "✍️"
+# 微信读书时间戳按北京时间展示，避免写入的时间整体偏移 8 小时
+CN_TZ = timezone(timedelta(hours=8))
+# 微信读书同步过来的记录统一标记为「书籍」
+WEREAD_ITEM_TYPE = "书籍"
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -48,6 +52,23 @@ NOTION_ID_PATTERN = re.compile(
 NOTION_ID_IN_TEXT_PATTERN = re.compile(
     r"([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
     re.IGNORECASE,
+)
+
+# 接口字段名在不同版本间有差异，按顺序兜底取值
+START_TIME_KEYS = (
+    "beginReadingTime",
+    "startReadingTime",
+    "beginReadTime",
+    "firstReadTime",
+    "readUpdateTime",
+    "createTime",
+)
+READING_TIME_KEYS = (
+    "recordReadingTime",
+    "readingTime",
+    "totalReadingTime",
+    "readTime",
+    "duration",
 )
 
 
@@ -182,6 +203,23 @@ def get_note_sort_key(item, chapter=None):
     return (chapter_idx, get_range_start(item))
 
 
+def pick_first_number(source, keys):
+    """按候选字段名依次取值，取到第一个有效数字为止。"""
+    for key in keys:
+        value = to_number(source.get(key))
+        if value:
+            return value
+    return 0
+
+
+def timestamp_to_local(value):
+    """微信读书时间戳 → 北京时间字符串；无值返回 None（不写入）。"""
+    number = to_number(value)
+    if not number:
+        return None
+    return datetime.fromtimestamp(number, tz=CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_bookmark_list(bookId):
     """获取我的划线"""
@@ -198,6 +236,17 @@ def get_read_info(bookId):
     reading_progress = normalize_reading_progress(progress)
     finish_time = book.get("finishTime") or 0
     update_time = book.get("updateTime") or 0
+    # 开始时间与阅读时长在不同接口版本里字段名不一致，逐个兜底
+    start_time = pick_first_number(book, START_TIME_KEYS)
+    reading_time = pick_first_number(book, READING_TIME_KEYS)
+    if not start_time:
+        print(
+            f"  [提示] 未取到开始时间，/book/getprogress 可用字段: {sorted(book.keys())}"
+        )
+    if not reading_time:
+        print(
+            f"  [提示] 未取到阅读时长，/book/getprogress 可用字段: {sorted(book.keys())}"
+        )
     if finish_time or progress >= 100:
         marked_status = 4
     elif update_time or book.get("isStartReading") or progress > 0:
@@ -206,9 +255,10 @@ def get_read_info(bookId):
         marked_status = 1
     return {
         "markedStatus": marked_status,
-        "readingTime": book.get("recordReadingTime") or 0,
+        "readingTime": reading_time,
         "readingProgress": reading_progress,
         "finishedDate": finish_time,
+        "startedDate": start_time,
     }
 
 
@@ -267,15 +317,29 @@ def get_review_list(bookId):
     return summary, reviews
 
 
-def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
-    filter = build_equals_filter("BookId", bookId)
-    response = query_data_source(filter=filter)
-    for result in response["results"]:
+def build_book_link(bookId):
+    return f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}"
+
+
+def find_existing(link):
+    """用「链接」定位已同步的记录。链接由 bookId 生成，天然唯一，
+    因此在模板删除 BookId 后仍可准确去重。"""
+    if "链接" not in data_source_property_types:
+        return []
+    response = query_data_source(filter=build_equals_filter("链接", link))
+    return response.get("results", [])
+
+
+def delete_existing(link):
+    """删除已存在的记录后重建（与原有行为一致，保证划线笔记是最新）。"""
+    removed = 0
+    for result in find_existing(link):
         try:
             client.blocks.delete(block_id=result["id"])
+            removed += 1
         except Exception as e:
             print(f"删除块时出错: {e}")
+    return removed
 
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
@@ -286,6 +350,27 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
+def format_reading_time(seconds):
+    """秒 → 'X时Y分' 文本（仅在「阅读时长」是文本列时使用）。"""
+    seconds = to_number(seconds) or 0
+    text = ""
+    hour = seconds // 3600
+    if hour > 0:
+        text += f"{hour}时"
+    minutes = seconds % 3600 // 60
+    if minutes > 0:
+        text += f"{minutes}分"
+    return text
+
+
+def reading_time_value(seconds):
+    """按「阅读时长」列的实际类型返回写入值：数字列写分钟，文本列写 'X时Y分'。"""
+    seconds = to_number(seconds) or 0
+    if get_property_type("阅读时长") == "number":
+        return max(0, round(seconds / 60))
+    return format_reading_time(seconds)
+
+
 def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
     """插入到notion"""
     if not cover or not cover.startswith("http"):
@@ -293,45 +378,49 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
     parent = {"type": "data_source_id", "data_source_id": data_source_id}
     raw_properties = {
         title_property_name: bookName,
-        "BookId": bookId,
-        "ISBN": isbn,
-        "链接": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
+        "链接": build_book_link(bookId),
         "作者": author,
-        "Sort": sort,
         "评分": rating,
+        "类型": WEREAD_ITEM_TYPE,
     }
+    # BookId / Sort / ISBN 仅在模板仍保留这些列时才写入，模板删列后自动跳过
+    if "BookId" in data_source_property_types:
+        raw_properties["BookId"] = bookId
+    if "Sort" in data_source_property_types:
+        raw_properties["Sort"] = sort
+    if "ISBN" in data_source_property_types:
+        raw_properties["ISBN"] = isbn
     if categories != None:
         raw_properties["分类"] = categories
     read_info = (
         get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
+        if has_any_property(
+            ("状态", "阅读时长", "阅读进度", "开始时间", "结束时间", "时间")
+        )
         else None
     )
     if read_info != None:
         markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime", 0)
         readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
-        raw_properties["阅读时长"] = format_time
+        raw_properties["阅读时长"] = reading_time_value(readingTime)
         raw_properties["阅读进度"] = readingProgress
-        if "finishedDate" in read_info:
-            raw_properties["时间"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+        finished_at = timestamp_to_local(read_info.get("finishedDate"))
+        if finished_at:
+            # 兼容仍在使用「时间」这一旧列名的模板
+            if "结束时间" in data_source_property_types:
+                raw_properties["结束时间"] = finished_at
+            elif "时间" in data_source_property_types:
+                raw_properties["时间"] = finished_at
+        started_at = timestamp_to_local(read_info.get("startedDate"))
+        if started_at and "开始时间" in data_source_property_types:
+            raw_properties["开始时间"] = started_at
 
     properties = build_notion_properties(raw_properties)
     icon = get_icon(cover)
     # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
+    response = client.pages.create(parent=parent, icon=icon, cover=icon, properties=properties)
     id = response["id"]
     return id
 
@@ -354,6 +443,27 @@ def add_grandchild(grandchild, results):
         client.blocks.children.append(block_id=id, children=[value])
 
 
+def get_sort():
+    """获取 data source 中已同步的最新 Sort，作为增量游标。
+    模板没有 Sort 列（或列为空）时返回 0，退化为全量处理。"""
+    if "Sort" not in data_source_property_types:
+        print("模板未保留 Sort 列，本次按全量处理")
+        return 0
+    filter = build_is_not_empty_filter("Sort")
+    sorts = [
+        {
+            "property": "Sort",
+            "direction": "descending",
+        }
+    ]
+    response = query_data_source(filter=filter, sorts=sorts, page_size=1)
+    if len(response.get("results")) == 1:
+        return get_number_property_value(
+            response.get("results")[0].get("properties").get("Sort")
+        )
+    return 0
+
+
 def get_notebooklist():
     """获取笔记本列表"""
     books = []
@@ -373,23 +483,6 @@ def get_notebooklist():
             hasMore = 0
     books.sort(key=lambda x: x.get("sort") or 0)
     return books
-
-
-def get_sort():
-    """获取 data source 中的最新时间"""
-    filter = build_is_not_empty_filter("Sort")
-    sorts = [
-        {
-            "property": "Sort",
-            "direction": "descending",
-        }
-    ]
-    response = query_data_source(filter=filter, sorts=sorts, page_size=1)
-    if len(response.get("results")) == 1:
-        return get_number_property_value(
-            response.get("results")[0].get("properties").get("Sort")
-        )
-    return 0
 
 
 def get_children(chapter, summary, bookmark_list):
@@ -586,7 +679,8 @@ def query_data_source(**body):
 
 
 def load_data_source_schema():
-    """读取当前 data source 的真实属性，只强制要求同步游标需要的字段。"""
+    """读取当前 data source 的真实属性。
+    BookId / Sort 不再强制要求，改用「链接」做去重，因此「链接」是必需的。"""
     global data_source_property_types, title_property_name, skipped_property_names
     response = client.request(path=f"data_sources/{data_source_id}", method="GET")
     properties = response.get("properties") or {}
@@ -605,13 +699,9 @@ def load_data_source_schema():
     if not title_property_name:
         raise Exception("Notion data source 缺少标题属性，请保留一个 Title 类型属性")
 
-    missing = [
-        name for name in ("BookId", "Sort") if name not in data_source_property_types
-    ]
-    if missing:
+    if "链接" not in data_source_property_types:
         raise Exception(
-            f"Notion data source 缺少必填属性: {', '.join(missing)}。"
-            "请在模板中补充后重试"
+            "Notion data source 缺少「链接」属性，无法判断书籍是否已同步，请在模板中补充后重试"
         )
 
     print(
@@ -688,8 +778,9 @@ def to_number(value):
 
 
 def normalize_date_value(value):
+    """时间戳按北京时间写入，避免整体偏移 8 小时。"""
     if isinstance(value, (int, float)):
-        return datetime.utcfromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(value, tz=CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
     return value
 
 
@@ -758,6 +849,25 @@ def get_number_property_value(property_value):
     return 0
 
 
+def is_property_empty(property_value):
+    """判断某个属性当前是否有值（用于 backfill 只补空缺）。"""
+    if not property_value:
+        return True
+    prop_type = property_value.get("type")
+    value = property_value.get(prop_type)
+    if value in (None, "", []):
+        return True
+    if prop_type == "number":
+        return value is None
+    if prop_type == "date":
+        return not (value or {}).get("start")
+    if prop_type in {"select", "status"}:
+        return not (value or {}).get("name")
+    if prop_type in {"title", "rich_text"}:
+        return not "".join(x.get("plain_text", "") for x in (value or [])).strip()
+    return False
+
+
 def resolve_data_source_id(notion_id):
     if os.getenv("NOTION_DATA_SOURCE_ID"):
         return notion_id
@@ -781,7 +891,8 @@ def resolve_data_source_id(notion_id):
     return sources[0]["id"]
 
 
-def sync():
+def setup_clients():
+    """初始化微信读书与 Notion 客户端并读取模板 schema。"""
     global client, data_source_id, weread
     secrets = validate_secret_inputs()
     notion_id = extract_notion_id()
@@ -796,12 +907,19 @@ def sync():
     print(f"Notion API Version: {NOTION_VERSION}")
     print(f"Notion Data Source ID: {data_source_id}")
     load_data_source_schema()
+
+
+def sync():
+    """增量同步：只处理 Sort 大于游标的书，已存在的记录先删除再重建。
+    已经同步过的书不会再次刷新属性，历史缺失数据请用 backfill 补齐。"""
+    setup_clients()
     latest_sort = get_sort()
+    print(f"增量游标 latest_sort = {latest_sort}")
     books = get_notebooklist()
     if books != None:
         for index, book in enumerate(books):
-            sort = book["sort"]
-            if sort <= latest_sort:
+            sort = book.get("sort") or 0
+            if latest_sort and sort <= latest_sort:
                 continue
             book = book.get("book") or book
             title = book.get("title") or ""
@@ -810,11 +928,12 @@ def sync():
             author = book.get("author") or ""
             if not bookId:
                 continue
+            book_link = build_book_link(bookId)
             categories = book.get("categories")
             if categories != None:
                 categories = [x["title"] for x in categories]
             print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
+            delete_existing(book_link)
             if has_any_property(("ISBN", "评分")):
                 isbn, rating = get_bookinfo(bookId)
             else:
@@ -836,6 +955,63 @@ def sync():
                 add_grandchild(grandchild, results)
 
 
+def backfill():
+    """只补缺失字段，绝不删除或重建任何页面。
+    用于修复历史数据（例如早期同步漏掉的开始时间 / 结束时间 / 阅读时长 / 类型）。"""
+    setup_clients()
+    books = get_notebooklist()
+    updated = 0
+    if books == None:
+        return
+    for index, book in enumerate(books):
+        book = book.get("book") or book
+        bookId = book.get("bookId")
+        title = book.get("title") or ""
+        if not bookId:
+            continue
+        existing = find_existing(build_book_link(bookId))
+        if not existing:
+            print(f"[跳过] {title}：Notion 中还没有这条记录")
+            continue
+        page = existing[0]
+        props = page.get("properties") or {}
+        missing = [
+            name
+            for name in ("类型", "开始时间", "结束时间", "阅读时长")
+            if name in data_source_property_types and is_property_empty(props.get(name))
+        ]
+        if not missing:
+            print(f"[无缺失] {title}")
+            continue
+        read_info = get_read_info(bookId=bookId)
+        raw = {}
+        if "类型" in missing:
+            raw["类型"] = WEREAD_ITEM_TYPE
+        if "开始时间" in missing:
+            started = timestamp_to_local(read_info.get("startedDate"))
+            if started:
+                raw["开始时间"] = started
+        if "结束时间" in missing:
+            finished = timestamp_to_local(read_info.get("finishedDate"))
+            if finished:
+                raw["结束时间"] = finished
+        if "阅读时长" in missing:
+            seconds = to_number(read_info.get("readingTime")) or 0
+            if seconds:
+                raw["阅读时长"] = reading_time_value(seconds)
+        if not raw:
+            print(f"[接口无数据] {title}：缺 {missing}，但微信读书未返回对应值")
+            continue
+        payload = build_notion_properties(raw)
+        if not payload:
+            print(f"[跳过] {title}：没有可写入的值")
+            continue
+        client.pages.update(page_id=page["id"], properties=payload)
+        updated += 1
+        print(f"[已补全] {title} -> {list(payload.keys())}")
+    print(f"\n回填完成，共更新 {updated} 条记录")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="weread2notion",
@@ -845,12 +1021,15 @@ def main(argv=None):
         "command",
         nargs="?",
         default="sync",
-        choices=["sync"],
-        help="Command to run. Defaults to sync.",
+        choices=["sync", "backfill"],
+        help="Command to run. Defaults to sync. backfill 只补缺失字段，不删除任何页面。",
     )
-    parser.parse_args(argv)
+    args = parser.parse_args(argv)
     try:
-        sync()
+        if args.command == "backfill":
+            backfill()
+        else:
+            sync()
     except ConfigError:
         raise SystemExit(1)
 
