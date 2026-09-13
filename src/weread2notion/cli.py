@@ -409,7 +409,9 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime", 0)
         readingProgress = read_info.get("readingProgress", 0)
-        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
+        # 三态阅读状态：未开始 / 在读 / 读完（模板无「状态」列时自动跳过）
+        status_map = {1: "未开始", 2: "在读", 4: "读完"}
+        raw_properties["状态"] = status_map.get(markedStatus, "在读")
         raw_properties["阅读时长"] = reading_time_value(readingTime)
         raw_properties["阅读进度"] = readingProgress
         finished_at = timestamp_to_local(read_info.get("finishedDate"))
@@ -468,6 +470,146 @@ def get_sort():
             response.get("results")[0].get("properties").get("Sort")
         )
     return 0
+
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000)
+def get_bookshelf():
+    """获取全量书架，覆盖「未开始阅读」的书。
+
+    走官方 skill 网关 /shelf/sync（请求参数通常为空）。
+    返回扁平化书籍列表，字段与 notebooks 模式尽量对齐，便于复用 insert_to_notion。
+
+    注意：/shelf/sync 返回 books[] 为扁平结构（bookId/title/author/cover/category/
+    finishReading/readUpdateTime 等均在项顶层），与 notebooks 包在 book 对象里不同。
+    不同 skill 版本可能把 books 包一层 data，这里做了兼容兜底。
+    """
+    data = weread.request("/shelf/sync")
+    payload = data.get("books") or (data.get("data") or {}).get("books") or []
+    books = []
+    for b in payload:
+        books.append({
+            "bookId": b.get("bookId"),
+            "title": b.get("title") or "",
+            "author": b.get("author") or "",
+            # 缩略图转高清，与 notebooks 模式保持一致
+            "cover": (b.get("cover") or "").replace("/s_", "/t7_"),
+            # 系统分类，单字符串（与 notebooks 的 categories 列表语义不同）
+            "category": b.get("category") or "",
+            "finishReading": to_number(b.get("finishReading")) or 0,
+            "readUpdateTime": to_number(b.get("readUpdateTime")) or 0,
+            "isTop": to_number(b.get("isTop")) or 0,
+            "secret": to_number(b.get("secret")) or 0,
+        })
+    # 有声书 / 专辑在独立数组 albums[]，合并进列表，分类标记为「有声书」
+    for a in (data.get("albums") or []):
+        info = a.get("albumInfo") or {}
+        extra = a.get("albumInfoExtra") or {}
+        if not info.get("albumId"):
+            continue
+        books.append({
+            "bookId": info.get("albumId"),
+            "title": info.get("name") or "",
+            "author": info.get("authorName") or "",
+            "cover": (info.get("cover") or "").replace("/s_", "/t7_"),
+            "category": "有声书",
+            "finishReading": to_number(info.get("finish")) or 0,
+            "readUpdateTime": to_number(extra.get("lectureReadUpdateTime")) or 0,
+            "isTop": to_number(extra.get("isTop")) or 0,
+            "secret": 0,
+        })
+    return books
+
+
+@retry(stop_max_attempt_number=3, wait_fixed=5000)
+def update_read_properties(page_id, bookId):
+    """已存在的书：只更新阅读状态相关字段（状态/阅读时长/阅读进度/开始/结束时间），
+    不删除重建、不拉取笔记正文。用于「全量枚举 + 增量更新」模式，保证页面 ID 稳定、省 API。"""
+    if not has_any_property(
+        ("状态", "阅读时长", "阅读进度", "开始时间", "结束时间", "时间")
+    ):
+        return
+    read_info = get_read_info(bookId=bookId)
+    if read_info is None:
+        return
+    markedStatus = read_info.get("markedStatus", 0)
+    readingTime = read_info.get("readingTime", 0)
+    readingProgress = read_info.get("readingProgress", 0)
+    status_map = {1: "未开始", 2: "在读", 4: "读完"}
+    raw = {
+        "状态": status_map.get(markedStatus, "在读"),
+        "阅读时长": reading_time_value(readingTime),
+        "阅读进度": readingProgress,
+    }
+    finished_at = timestamp_to_local(read_info.get("finishedDate"))
+    if finished_at:
+        # 兼容仍在使用「时间」这一旧列名的模板
+        if "结束时间" in data_source_property_types:
+            raw["结束时间"] = finished_at
+        elif "时间" in data_source_property_types:
+            raw["时间"] = finished_at
+    started_at = timestamp_to_local(read_info.get("startedDate"))
+    if started_at and "开始时间" in data_source_property_types:
+        raw["开始时间"] = started_at
+    payload = build_notion_properties(raw)
+    if payload:
+        client.pages.update(page_id=page_id, properties=payload)
+
+
+def _sync_shelf():
+    """全量枚举 + 增量更新：每日用 /shelf/sync 扫全量书架（含未开始阅读的书），
+    但「已存在的书」只更新阅读状态字段（不删除重建），「新书 / 未开始阅读的书」才新建页面。
+
+    - 全量枚举：每天仍扫描整个书架，因此新加入书架、以及从未打开的书都会被纳入。
+    - 增量更新：已同步的书只刷新「状态 / 阅读时长 / 阅读进度 / 开始 / 结束时间」，
+      页面 ID 永久稳定、省 API；划线 / 笔记正文仅在「新书」或手动 backfill 时才刷新。
+    """
+    print("同步模式: 全量书架 (shelf) —— 全量枚举 + 增量更新")
+    books = get_bookshelf()
+    print(f"书架共 {len(books)} 本（含电子书与有声书）")
+    for index, b in enumerate(books):
+        bookId = b.get("bookId")
+        title = b.get("title") or ""
+        if not bookId:
+            continue
+        print(f"正在同步 {title} ,当前是第{index+1}本，共{len(books)}本。")
+        book_link = build_book_link(bookId)
+
+        # 全量枚举：先按「链接」查这本书是否已在 Notion
+        existing = find_existing(book_link)
+        if existing:
+            # 已存在 → 只更新阅读状态，不删除重建（页面 ID 稳定、省 API）
+            update_read_properties(existing[0]["id"], bookId)
+            continue
+
+        # 新书 / 未开始阅读的书 → 完整新建（含笔记）
+        isbn, rating = ("", None)
+        if has_any_property(("ISBN", "评分")):
+            isbn, rating = get_bookinfo(bookId)
+        category = b.get("category")
+        # 系统分类转成列表，喂给 insert_to_notion 的 categories 参数
+        categories = [category] if category else None
+        # 由 insert_to_notion 内部调 /book/getprogress 拿准确三态/时长/进度，
+        # 未开始阅读的书同样会返回 markedStatus=1 → 「未开始」
+        id = insert_to_notion(
+            title, bookId, b.get("cover") or "", None, b.get("author") or "",
+            isbn, rating, categories,
+        )
+        # 未开始阅读的书没有笔记/划线，跳过内容抓取，节省 API 调用
+        if not to_number(b.get("readUpdateTime")) and to_number(b.get("finishReading")) != 1:
+            continue
+        chapter = get_chapter_info(bookId)
+        bookmark_list = get_bookmark_list(bookId)
+        summary, reviews = get_review_list(bookId)
+        bookmark_list.extend(reviews)
+        bookmark_list = sorted(
+            bookmark_list,
+            key=lambda x: get_note_sort_key(x, chapter),
+        )
+        children, grandchild = get_children(chapter, summary, bookmark_list)
+        if children:
+            results = add_children(id, children)
+            if grandchild and results != None:
+                add_grandchild(grandchild, results)
 
 
 def get_notebooklist():
@@ -916,9 +1058,17 @@ def setup_clients():
 
 
 def sync():
-    """增量同步：只处理 Sort 大于游标的书，已存在的记录先删除再重建。
-    已经同步过的书不会再次刷新属性，历史缺失数据请用 backfill 补齐。"""
+    """同步微信读书到 Notion。
+
+    默认 shelf 模式：全量枚举 + 增量更新书架（含未开始阅读的书）——每天扫描全部书架，
+    新书/未读书新建页面，已存在的书只刷新阅读状态字段，页面 ID 稳定、省 API。
+    设置环境变量 WEREAD_SYNC_MODE=notebooks：切回仅同步有笔记/划线的书（原行为）。
+    """
     setup_clients()
+    sync_mode = (os.getenv("WEREAD_SYNC_MODE") or "shelf").lower()
+    if sync_mode == "shelf":
+        _sync_shelf()
+        return
     latest_sort = get_sort()
     print(f"增量游标 latest_sort = {latest_sort}")
     books = get_notebooklist()
