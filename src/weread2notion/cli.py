@@ -45,8 +45,20 @@ def _parse_write_interval():
         return 0.3
 
 
+def _parse_progress_threshold():
+    try:
+        return min(max(float(os.getenv("WEREAD_LOW_PROGRESS_THRESHOLD") or "0.1"), 0), 1)
+    except (TypeError, ValueError):
+        return 0.1
+
+
 NOTION_WRITE_INTERVAL = _parse_write_interval()
 NOTION_VERSION = os.getenv("NOTION_API_VERSION") or "2026-03-11"
+# 阅读进度低于该比例（0–1 归一化，0.1 = 10%）的「在读」书，在 Notion 中视作「未开始」。
+# 即只翻开头就停下的书不再占着「在读」。可用环境变量调整：
+#   export WEREAD_LOW_PROGRESS_THRESHOLD=0.1
+LOW_PROGRESS_THRESHOLD = _parse_progress_threshold()
+
 BOOKMARK_CALLOUT_ICON = "〰️"
 NOTE_CALLOUT_ICON = "✍️"
 # 刷新划线时只覆盖「本程序生成的块」，避免删掉用户在页面里手写的内容：
@@ -289,6 +301,22 @@ def normalize_reading_progress(value):
     return round(min(max(value, 0), 1), 4)
 
 
+def derive_status(marked_status, reading_progress):
+    """根据微信读书的阅读状态 + 阅读进度推导 Notion 的「状态」字段。
+
+    默认映射：1→未开始 / 2→在读 / 4→读完（与微信读书 markedStatus 对齐）。
+    特殊规则：标记为「在读」但阅读进度低于 LOW_PROGRESS_THRESHOLD（默认 10%）时，
+    视作「未开始」——只翻开头就停下的书不再占着「在读」，更符合实际阅读状态。
+    该规则对「未开始 / 读完」无效，不影响这两类。
+    """
+    base = {1: "未开始", 2: "在读", 4: "读完"}.get(int(to_number(marked_status) or 0), "在读")
+    if base == "在读":
+        progress = to_number(reading_progress)
+        if progress is not None and progress < LOW_PROGRESS_THRESHOLD:
+            return "未开始"
+    return base
+
+
 def normalize_rating(value):
     value = value or 0
     if value > 100:
@@ -439,9 +467,9 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
         markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime", 0)
         readingProgress = read_info.get("readingProgress", 0)
-        # 三态阅读状态：未开始 / 在读 / 读完（模板无「状态」列时自动跳过）
-        status_map = {1: "未开始", 2: "在读", 4: "读完"}
-        raw_properties["状态"] = status_map.get(markedStatus, "在读")
+        # 三态阅读状态：未开始 / 在读 / 读完；
+        # 另含规则：在读且阅读进度 < 10% 视作未开始（见 derive_status）
+        raw_properties["状态"] = derive_status(markedStatus, readingProgress)
         raw_properties["阅读时长"] = reading_time_value(readingTime)
         raw_properties["阅读进度"] = readingProgress
         finished_at = timestamp_to_local(read_info.get("finishedDate"))
@@ -577,8 +605,8 @@ def update_read_properties(page_id, bookId, sort=None):
             markedStatus = read_info.get("markedStatus", 0)
             readingTime = read_info.get("readingTime", 0)
             readingProgress = read_info.get("readingProgress", 0)
-            status_map = {1: "未开始", 2: "在读", 4: "读完"}
-            raw["状态"] = status_map.get(markedStatus, "在读")
+            # 在读且阅读进度 < 10% 视作未开始（见 derive_status）
+            raw["状态"] = derive_status(markedStatus, readingProgress)
             raw["阅读时长"] = reading_time_value(readingTime)
             raw["阅读进度"] = readingProgress
             finished_at = timestamp_to_local(read_info.get("finishedDate"))
@@ -1441,6 +1469,7 @@ def main(argv=None):
             "可用环境变量：WEREAD_SYNC_MODE=shelf|notebooks（默认 shelf，全量书架）、"
             "WEREAD_REFRESH_MODE=full|skip（skip 时只更新阅读状态，不重写划线正文）、"
             "WEREAD_STRICT=true（有书失败即以非 0 退出）、"
+            "WEREAD_LOW_PROGRESS_THRESHOLD=0.1（在读但进度低于该比例视作未开始）、"
             "NOTION_WRITE_INTERVAL=0.3（Notion 写操作节流秒数）"
         ),
     )
