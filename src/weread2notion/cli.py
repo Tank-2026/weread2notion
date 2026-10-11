@@ -35,7 +35,11 @@ weread = None
 load_dotenv()
 WEREAD_URL = "https://weread.qq.com/"
 WEREAD_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
-WEREAD_SKILL_VERSION = "1.0.4"
+# 微信读书 Skill 协议版本：网关会校验此版本号，过低时返回 upgrade_info 并拒绝请求
+# （2026-10-11 起网关强制要求 1.0.6，旧版 1.0.4 报「skill 需要升级」）。
+# 下次网关升级时，可在 workflow 环境变量里直接覆盖，无需改代码：
+#   export WEREAD_SKILL_VERSION=1.0.7
+WEREAD_SKILL_VERSION = os.getenv("WEREAD_SKILL_VERSION") or "1.0.6"
 # Notion 官方限流约 3 次/秒，所有写操作统一节流，避免 429。
 # 网络较差时可调大：export NOTION_WRITE_INTERVAL=0.5
 def _parse_write_interval():
@@ -205,12 +209,32 @@ class WeReadGatewayClient:
             **kwargs,
         }
         response = self.session.post(WEREAD_GATEWAY_URL, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        # 先解析业务错误码：网关鉴权失败时返回 HTTP 401，但 body 里仍带 errcode。
+        # 若先 raise_for_status() 会丢失 errcode 语义，导致「同步失败」却看不到具体原因。
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
         if data.get("upgrade_info"):
             raise Exception(f"微信读书 skill 需要升级: {data.get('upgrade_info')}")
-        if data.get("errcode", 0) != 0:
-            raise Exception(f"微信读书 Gateway 请求失败: {api_name}, errcode={data.get('errcode')}, response={data}")
+        errcode = data.get("errcode", 0)
+        if errcode != 0:
+            errmsg = data.get("errmsg") or ""
+            if errcode == -2010:
+                raise Exception(
+                    "微信读书 API Key 已失效（errcode=-2010 用户不存在）。"
+                    "请到 https://weread.qq.com/r/weread-skills 重新扫码获取新 Key，"
+                    "并更新 GitHub Actions Secrets 中的 WEREAD_API_KEY 后重试。"
+                )
+            if errcode == -2012:
+                raise Exception(
+                    "微信读书登录态已过期（errcode=-2012）。"
+                    "请到 https://weread.qq.com/r/weread-skills 重新扫码获取 API Key。"
+                )
+            raise Exception(
+                f"微信读书 Gateway 请求失败: {api_name}, errcode={errcode}, errmsg={errmsg}"
+            )
+        response.raise_for_status()
         return data
 
 
